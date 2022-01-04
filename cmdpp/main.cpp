@@ -7,7 +7,7 @@
 #include "mpzArray.h"
 #include "Timer.h"
 
-#define CONSTANT_WIDTH_BATCHES 0
+#define CONSTANT_WIDTH_BATCHES 1
 #define LOG_STATUS 1
 #define FALLBACK_VALUES 1
 
@@ -55,11 +55,9 @@ void BatchRanges(Range splitRange, int n, std::vector<Range>& ranges)
 #endif
 }
 
-void CheckBatch(Range check, int arrOffset, mpz_t& startProd, std::vector<uint64_t>& primes)
+void CheckBatch(Range check, int arrOffset, mpz_t& startProd, std::vector<uint64_t>& primes, double* msTime)
 {
-#if LOG_STATUS == 1
     Timer t;
-#endif
     for (int index = check.start; index <= check.end; index++)
     {
         mpz_mul_ui(startProd, startProd, primes[index - 1 - arrOffset]);
@@ -73,20 +71,31 @@ void CheckBatch(Range check, int arrOffset, mpz_t& startProd, std::vector<uint64
         mpz_sub_ui(startProd, startProd, 1);
     }
 
-#if LOG_STATUS == 1
     t.Stop();
+    *msTime = t.duration * 0.001;
+
+#if LOG_STATUS == 1
     std::stringstream msg;
     msg << "Thread: " << check.start << " - " << check.end << " finished in " << t.duration * 0.000001 << "s" << std::endl;
     std::cout << msg.str();
 #endif
 }
 
-void Run(Range r, std::vector<Range>* rangesPtr = nullptr)
+void Run(Range r, std::vector<Range>* rangesPtr = nullptr, int useThreads = -1, std::vector<double>* timesPtr = nullptr)
 {
     uint32_t N = r.end - r.start + 1;
 
     // Hardware lookup
-    int threadNum = std::thread::hardware_concurrency();
+    int threadNum = 1;
+    int hardThreads = std::thread::hardware_concurrency();
+    if (useThreads > 0 && useThreads <= hardThreads)
+    {
+        threadNum = useThreads;
+    }
+    else
+    {
+        threadNum = hardThreads;
+    }
 
     Timer t;
 
@@ -198,6 +207,7 @@ void Run(Range r, std::vector<Range>* rangesPtr = nullptr)
 
     // Initialize threads on each batch
     std::vector<std::thread> threads;
+    std::vector<double> times(threadNum);
 
     for (int t = 0; t < threadNum; t++)
     {
@@ -206,25 +216,114 @@ void Run(Range r, std::vector<Range>* rangesPtr = nullptr)
 
         if (t == 0)
         {
-            threads.push_back(std::thread(CheckBatch, ranges[t], r.start - 1, std::ref(offsetProd), std::ref(primes)));
+            threads.push_back(std::thread(CheckBatch, ranges[t], r.start - 1, std::ref(offsetProd), std::ref(primes), &times[t]));
         }
         else
         {
-            threads.push_back(std::thread(CheckBatch, ranges[t], r.start - 1, std::ref(arr[t - 1]), std::ref(primes)));
+            threads.push_back(std::thread(CheckBatch, ranges[t], r.start - 1, std::ref(arr[t - 1]), std::ref(primes), &times[t]));
         }
     }
 
     // Wait till all threads are complete
     for (std::thread& t : threads) { t.join(); }
 
+    if (timesPtr) { *timesPtr = times; }
+
     t.Stop();
+#if LOG_STATUS == 1
     std::cout << "Took: " << t.duration * 0.001 << "ms" << std::endl;
+#endif
 }
 
 /// Generate a way of splitting 'r' into 'n' ranges with similar computation times
 std::vector<Range> Tune(Range r, int n, int iter)
 {
+    uint32_t N = r.end - r.start + 1;
+    std::vector<Range> ranges;
+    std::vector<Range> bestRanges;
+    std::vector<double> bestWidths;
+    double bestTime = 10000000000;
 
+    // Generate initial guess for ranges
+    BatchRanges(r, n, ranges);
+
+    std::vector<double> times, widths = { 0 };
+    for (int i = 0; i < iter; i++)
+    {
+        // Run cmdpp
+        Run(r, &ranges, n, &times);
+
+        // Calculate average thread time
+        double averageTime = 0;
+        double maxTime = 0;
+        for (double t : times)
+        {
+            averageTime += t;
+            if (t > maxTime) { maxTime = t; }
+        }
+        averageTime /= n;
+
+        // Update bestRanges
+        if (maxTime < bestTime)
+        {
+            bestTime = maxTime;
+            bestRanges = ranges;
+            bestWidths = widths;
+        }
+
+        widths = std::vector<double>(ranges.size());
+        // Calculate range widths
+        for (int r = 0; r < ranges.size(); r++)
+        {
+            widths[r] = ranges[r].end - ranges[r].start + 1;
+        }
+
+        // Scale widths
+        double widthSum = 0;
+        for (int r = 0; r < widths.size(); r++)
+        {
+            widths[r] *= (double)averageTime / times[r];
+            widthSum += widths[r];
+        }
+
+        // Ensure widths sum to N
+        for (int r = 0; r < widths.size(); r++)
+        {
+            widths[r] *= N;
+            widths[r] /= widthSum;
+        }
+
+        // Round widths to integers
+        widthSum = 0;
+        for (int r = 0; r < widths.size() - 1; r++)
+        {
+            widths[r] = round(widths[r]);
+            widthSum += widths[r];
+        }
+        widths[widths.size() - 1] = N - widthSum;
+
+        // Update ranges
+        uint32_t start = r.start;
+        for (int r = 0; r < ranges.size(); r++)
+        {
+            ranges[r].start = start;
+            ranges[r].end = start + widths[r] - 1;
+
+            start += widths[r];
+        }
+    }
+
+    std::cout << "\nFinal Batch widths:\n";
+    for (double w : bestWidths)
+    {
+        std::cout << w << ", ";
+    }
+    std::cout << "\nFinal Batches:\n";
+    for (Range batch : bestRanges)
+    {
+        std::cout << batch.start << " - " << batch.end << ", ";
+    }
+    std::cout << "\n";
 }
 
 int main(int argc, char* argv[])
@@ -236,7 +335,7 @@ int main(int argc, char* argv[])
 #if FALLBACK_VALUES == 0
         std::cout << "Wrong number of args.\n";
 #else
-        start = 1; end = 1e5;
+        start = 1; end = 100000;
         goto run;
 #endif
         return 1;
@@ -259,7 +358,7 @@ int main(int argc, char* argv[])
     }
 
 run:
-    Tune(Range(start, end), std::thread::hardware_concurrency(), 10);
+    Tune(Range(start, end), std::thread::hardware_concurrency(), 30);
 
     //Run(Range(start, end));
 }
